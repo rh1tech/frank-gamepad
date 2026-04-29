@@ -190,6 +190,24 @@ void tuh_xinput_umount_cb(uint8_t dev_addr, uint8_t instance) {
     }
 }
 
+// Quantise analog axes into three bins — negative, centre, positive — so
+// idle stick jitter (Xbox pads drift ~±2000 LSB at rest) does not flood
+// report_seq with noise, but deliberate stick pushes still emit as
+// byte-level diffs the capture logic can pick up.
+//
+// Thresholds are intentionally wide: an Xbox 360 at rest hovers within
+// ~±4000 (high byte ±0x10), so 0x20 gives a comfortable guard-band.
+static inline uint8_t xinput_axis_quantise(int16_t v) {
+    const int16_t threshold = 0x2000;   // ≈25% deflection
+    if (v >  threshold) return 0x7F;
+    if (v < -threshold) return 0x80;
+    return 0x00;
+}
+
+static inline uint8_t xinput_trigger_quantise(uint8_t v) {
+    return v > 0x20 ? 0xFF : 0x00;
+}
+
 void tuh_xinput_report_received_cb(uint8_t dev_addr, uint8_t instance,
                                    xinputh_interface_t const *xid_itf,
                                    uint16_t len) {
@@ -201,16 +219,23 @@ void tuh_xinput_report_received_cb(uint8_t dev_addr, uint8_t instance,
         uint8_t synth[USBHID_XINPUT_REPORT_LEN];
         synth[0] = (uint8_t)(p->wButtons & 0xFF);
         synth[1] = (uint8_t)((p->wButtons >> 8) & 0xFF);
-        synth[2] = p->bLeftTrigger;
-        synth[3] = p->bRightTrigger;
-        synth[4] = (uint8_t)((uint16_t)p->sThumbLX >> 8);
-        synth[5] = (uint8_t)((uint16_t)p->sThumbLY >> 8);
-        synth[6] = (uint8_t)((uint16_t)p->sThumbRX >> 8);
-        synth[7] = (uint8_t)((uint16_t)p->sThumbRY >> 8);
+        synth[2] = xinput_trigger_quantise(p->bLeftTrigger);
+        synth[3] = xinput_trigger_quantise(p->bRightTrigger);
+        synth[4] = xinput_axis_quantise(p->sThumbLX);
+        synth[5] = xinput_axis_quantise(p->sThumbLY);
+        synth[6] = xinput_axis_quantise(p->sThumbRX);
+        synth[7] = xinput_axis_quantise(p->sThumbRY);
 
-        memcpy(g_report, synth, sizeof(synth));
-        g_report_len = sizeof(synth);
-        g_report_seq++;
+        // Only tick report_seq when the synthetic frame actually changes —
+        // Xbox 360 wired streams ~60 reports/sec regardless of input, so
+        // without this filter the capture state machine sees a flood of
+        // identical "changes" and the baseline settle window never expires.
+        if (g_report_len != sizeof(synth) ||
+            memcmp(g_report, synth, sizeof(synth)) != 0) {
+            memcpy(g_report, synth, sizeof(synth));
+            g_report_len = sizeof(synth);
+            g_report_seq++;
+        }
     }
     tuh_xinput_receive_report(dev_addr, instance);
 }
