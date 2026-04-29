@@ -21,14 +21,21 @@ extern "C" {
 #define USBHID_MAX_REPORT_LEN 64
 #define USBHID_MAX_STRING_LEN 64
 
+typedef enum {
+    USBHID_SOURCE_NONE = 0,
+    USBHID_SOURCE_HID,
+    USBHID_SOURCE_XINPUT,
+} usbhid_source_t;
+
 typedef struct {
     int connected;                              // non-zero when a gamepad/joystick is attached
+    usbhid_source_t source;                     // transport that delivered the report
     uint16_t vid;
     uint16_t pid;
     char manufacturer[USBHID_MAX_STRING_LEN];
     char product[USBHID_MAX_STRING_LEN];
     char serial[USBHID_MAX_STRING_LEN];
-    uint16_t report_len;                        // length of latest report
+    uint16_t report_len;                        // length of latest report (synthetic for XInput)
     uint8_t report[USBHID_MAX_REPORT_LEN];      // latest raw report bytes
     uint32_t report_seq;                        // increments on every new report
 } usbhid_device_t;

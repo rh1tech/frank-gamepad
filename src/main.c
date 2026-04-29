@@ -61,6 +61,7 @@ typedef enum {
     SCENE_BASELINE,         // "CAPTURING BASELINE"
     SCENE_BASELINE_FAIL,    // "BASELINE TIMEOUT"
     SCENE_PROMPT,           // highlight one button, prompt press
+    SCENE_PROMPT_ALIAS,     // "press AGAIN (any alias, or wait to skip)"
     SCENE_CAPTURED,         // button captured, green flash
     SCENE_SAVING,
     SCENE_SAVED,
@@ -102,6 +103,16 @@ typedef struct {
     bool captured;
 } button_capture_t;
 
+// Some pads expose two physical keys for the same logical action (e.g. a
+// D-pad AND a left analog stick that reports through different bytes of
+// the same report). We ask the user to press each button twice and, if
+// the second press hits different bits, record it as an alias.
+typedef struct {
+    button_capture_t primary;
+    button_capture_t alias;
+    bool has_alias;
+} button_record_t;
+
 static const ui_button_t CAPTURE_ORDER[UI_BTN_COUNT] = {
     UI_BTN_UP, UI_BTN_DOWN, UI_BTN_LEFT, UI_BTN_RIGHT,
     UI_BTN_SELECT, UI_BTN_START,
@@ -123,10 +134,19 @@ static void paint_status(const char *msg, uint8_t color) {
     ui_draw_text_centered(FRAME, 184, msg, color);
 }
 
+static const char *source_label(usbhid_source_t s) {
+    switch (s) {
+        case USBHID_SOURCE_HID:    return "HID";
+        case USBHID_SOURCE_XINPUT: return "XINPUT";
+        default:                   return "?";
+    }
+}
+
 static void paint_device_line(const usbhid_device_t *dev) {
     char line[80];
     if (dev && dev->connected) {
-        snprintf(line, sizeof(line), "VID=%04X PID=%04X", dev->vid, dev->pid);
+        snprintf(line, sizeof(line), "VID=%04X PID=%04X  %s",
+                 dev->vid, dev->pid, source_label(dev->source));
     } else {
         snprintf(line, sizeof(line), "NO DEVICE");
     }
@@ -159,6 +179,17 @@ static void render_scene(void) {
             ui_highlight_button(FRAME, g_scene.prompt_btn, UI_COLOR_HIGHLIGHT);
             char prompt[64];
             snprintf(prompt, sizeof(prompt), "PRESS %s  (%d/%d)",
+                     ui_button_label(g_scene.prompt_btn),
+                     g_scene.prompt_idx, g_scene.prompt_total);
+            paint_status(prompt, UI_COLOR_TEXT);
+            break;
+        }
+
+        case SCENE_PROMPT_ALIAS: {
+            ui_highlight_button(FRAME, g_scene.prompt_btn, UI_COLOR_HIGHLIGHT);
+            char prompt[64];
+            snprintf(prompt, sizeof(prompt),
+                     "PRESS %s AGAIN OR WAIT (%d/%d)",
                      ui_button_label(g_scene.prompt_btn),
                      g_scene.prompt_idx, g_scene.prompt_total);
             paint_status(prompt, UI_COLOR_TEXT);
@@ -260,24 +291,38 @@ static int capture_baseline(usbhid_device_t *dev, uint8_t *baseline, uint32_t ti
     return 0;
 }
 
-// Returns true once a non-baseline press was observed, and fills *cap.
-// Waits indefinitely (caller is responsible for cancel path via disconnect).
-static bool capture_one_button(usbhid_device_t *dev,
-                               const uint8_t *baseline,
-                               uint16_t baseline_len,
-                               button_capture_t *cap) {
+typedef enum {
+    CAPTURE_OK = 0,         // got a press, *cap filled
+    CAPTURE_TIMEOUT,        // wait_ms expired before any press
+    CAPTURE_DISCONNECTED,   // device unplugged mid-capture
+} capture_result_t;
+
+// Capture one press. If wait_ms == 0, wait indefinitely; otherwise bail out
+// with CAPTURE_TIMEOUT if no press arrives within that window.
+static capture_result_t capture_one_button(usbhid_device_t *dev,
+                                           const uint8_t *baseline,
+                                           uint16_t baseline_len,
+                                           button_capture_t *cap,
+                                           uint32_t wait_ms) {
     uint32_t last_seq = dev->report_seq;
+    uint32_t wait_deadline = wait_ms > 0
+        ? to_ms_since_boot(get_absolute_time()) + wait_ms
+        : 0;
 
     // Step 1: wait for the report to differ from baseline (press).
     // Always sleep between iterations — even when reports are streaming,
     // otherwise we hammer tuh_task() at ~1 MHz and starve HDMI DMA.
     while (true) {
         usbhid_task();
-        if (!usbhid_gamepad_connected()) return false;
+        if (!usbhid_gamepad_connected()) return CAPTURE_DISCONNECTED;
         bool got_new = poll_report(dev, &last_seq);
         if (got_new && dev->report_len == baseline_len &&
             memcmp(dev->report, baseline, baseline_len) != 0) {
             break;
+        }
+        if (wait_ms > 0 &&
+            to_ms_since_boot(get_absolute_time()) >= wait_deadline) {
+            return CAPTURE_TIMEOUT;
         }
         sleep_ms(16);
     }
@@ -289,7 +334,7 @@ static bool capture_one_button(usbhid_device_t *dev,
     uint32_t deadline = to_ms_since_boot(get_absolute_time()) + 80;
     while (to_ms_since_boot(get_absolute_time()) < deadline) {
         usbhid_task();
-        if (!usbhid_gamepad_connected()) return false;
+        if (!usbhid_gamepad_connected()) return CAPTURE_DISCONNECTED;
         if (poll_report(dev, &last_seq)) {
             if (dev->report_len == baseline_len &&
                 memcmp(dev->report, baseline, baseline_len) != 0) {
@@ -315,11 +360,25 @@ static bool capture_one_button(usbhid_device_t *dev,
     deadline = to_ms_since_boot(get_absolute_time()) + 3000;
     while (to_ms_since_boot(get_absolute_time()) < deadline) {
         usbhid_task();
-        if (!usbhid_gamepad_connected()) return false;
+        if (!usbhid_gamepad_connected()) return CAPTURE_DISCONNECTED;
         if (poll_report(dev, &last_seq)) {
             if (memcmp(dev->report, baseline, baseline_len) == 0) break;
         }
         sleep_ms(16);
+    }
+    return CAPTURE_OK;
+}
+
+// Two captures are "the same physical input" iff they flipped the same
+// bits in the same bytes. We compare masks, not raw values — an analog
+// stick can land on slightly different coordinates between presses, which
+// should NOT be treated as a new alias.
+static bool captures_match(const button_capture_t *a, const button_capture_t *b) {
+    if (!a->captured || !b->captured) return false;
+    if (a->len != b->len) return false;
+    for (int i = 0; i < a->len; i++) {
+        if (a->mask_high[i] != b->mask_high[i]) return false;
+        if (a->mask_low[i]  != b->mask_low[i])  return false;
     }
     return true;
 }
@@ -370,7 +429,7 @@ static void format_bytes(const uint8_t *data, uint16_t len, char *buf, size_t sz
 static bool save_log(const usbhid_device_t *dev,
                      const uint8_t *baseline,
                      uint16_t baseline_len,
-                     const button_capture_t *caps) {
+                     const button_record_t *recs) {
     char path[40];
     snprintf(path, sizeof(path), "gamepad_%04X_%04X.txt", dev->vid, dev->pid);
 
@@ -385,6 +444,7 @@ static bool save_log(const usbhid_device_t *dev,
     char bytes[3 * USBHID_MAX_REPORT_LEN + 1];
 
     f_printf(&f, "# frank-gamepad capture log\n");
+    f_printf(&f, "Source=%s\n", source_label(dev->source));
     f_printf(&f, "VID=0x%04X\n", dev->vid);
     f_printf(&f, "PID=0x%04X\n", dev->pid);
     f_printf(&f, "Manufacturer=%s\n", dev->manufacturer[0] ? dev->manufacturer : "(none)");
@@ -396,12 +456,20 @@ static bool save_log(const usbhid_device_t *dev,
 
     for (int i = 0; i < UI_BTN_COUNT; i++) {
         ui_button_t b = CAPTURE_ORDER[i];
-        const button_capture_t *c = &caps[b];
+        const button_record_t *r = &recs[b];
+        const button_capture_t *c = &r->primary;
         if (c->captured) {
             format_capture(c, line, sizeof(line));
             format_bytes(c->value, c->len, bytes, sizeof(bytes));
             f_printf(&f, "%s=%s\n", ui_button_label(b), line);
             f_printf(&f, "#   raw: %s\n", bytes);
+            if (r->has_alias && r->alias.captured) {
+                const button_capture_t *a = &r->alias;
+                format_capture(a, line, sizeof(line));
+                format_bytes(a->value, a->len, bytes, sizeof(bytes));
+                f_printf(&f, "%s_ALT=%s\n", ui_button_label(b), line);
+                f_printf(&f, "#   raw: %s\n", bytes);
+            }
         } else {
             f_printf(&f, "%s=(skipped)\n", ui_button_label(b));
         }
@@ -430,10 +498,10 @@ static void wait_for_device(usbhid_device_t *dev) {
     }
 }
 
-// The capture_t array is ~4 KB (12 * sizeof(button_capture_t)), which blows
-// the default 2 KB per-core stack on RP2350 — stack-allocated it hardfaults
-// on return from capture_baseline. Move to .bss instead.
-static button_capture_t s_caps[UI_BTN_COUNT];
+// The record array is ~8 KB (12 * sizeof(button_record_t) — primary + alias),
+// which blows the default 2 KB per-core stack on RP2350 — stack-allocating
+// it hardfaults on return from capture_baseline. Move to .bss instead.
+static button_record_t s_records[UI_BTN_COUNT];
 static uint8_t s_baseline[USBHID_MAX_REPORT_LEN];
 
 static void run_session(void) {
@@ -453,7 +521,12 @@ static void run_session(void) {
         return;
     }
 
-    memset(s_caps, 0, sizeof(s_caps));
+    memset(s_records, 0, sizeof(s_records));
+
+    // How long to wait for a second (alias) press before assuming the pad
+    // has no secondary input for this action. Long enough that a user who
+    // wants to press can — short enough that skipping doesn't feel slow.
+    const uint32_t ALIAS_TIMEOUT_MS = 2000;
 
     for (int i = 0; i < UI_BTN_COUNT; i++) {
         if (!usbhid_gamepad_connected()) return;
@@ -461,6 +534,7 @@ static void run_session(void) {
         printf("[cap] prompt %d/%d = %s, core1_hb=%u\n",
                i + 1, UI_BTN_COUNT, ui_button_label(b), (unsigned)core1_heartbeat);
 
+        // Primary press — blocks until the user presses.
         g_scene.kind = SCENE_PROMPT;
         g_scene.dev = &dev;
         g_scene.prompt_btn = b;
@@ -468,8 +542,24 @@ static void run_session(void) {
         g_scene.prompt_total = UI_BTN_COUNT;
         render_scene();
 
-        if (!capture_one_button(&dev, s_baseline, baseline_len, &s_caps[b])) {
-            return;
+        capture_result_t rc = capture_one_button(&dev, s_baseline, baseline_len,
+                                                 &s_records[b].primary, 0);
+        if (rc == CAPTURE_DISCONNECTED) return;
+
+        // Alias press — time-boxed. Users with pads that have no alias
+        // (e.g. a single D-pad) just wait it out. If the second press hits
+        // the same bits, it's the same physical control — no alias logged.
+        g_scene.kind = SCENE_PROMPT_ALIAS;
+        render_scene();
+
+        button_capture_t alt = {0};
+        rc = capture_one_button(&dev, s_baseline, baseline_len,
+                                &alt, ALIAS_TIMEOUT_MS);
+        if (rc == CAPTURE_DISCONNECTED) return;
+        if (rc == CAPTURE_OK && !captures_match(&s_records[b].primary, &alt)) {
+            s_records[b].alias = alt;
+            s_records[b].has_alias = true;
+            printf("[cap]   alias captured for %s\n", ui_button_label(b));
         }
 
         g_scene.kind = SCENE_CAPTURED;
@@ -479,7 +569,7 @@ static void run_session(void) {
 
     g_scene.kind = SCENE_SAVING;
     render_scene();
-    bool ok = save_log(&dev, s_baseline, baseline_len, s_caps);
+    bool ok = save_log(&dev, s_baseline, baseline_len, s_records);
     g_scene.kind = ok ? SCENE_SAVED : SCENE_SAVE_FAIL;
     render_scene();
     sleep_ms(ok ? 1500 : 3000);
@@ -646,8 +736,8 @@ static void main_unused(void) {
     // Step E: call capture_one_button exactly like run_session would.
     printf("[step] E: entering capture_one_button (waiting for UP press)\n");
     button_capture_t cap;
-    bool ok = capture_one_button(&dev, baseline, baseline_len, &cap);
-    printf("[step] E done: ok=%d, HDMI?\n", (int)ok);
+    capture_result_t rc = capture_one_button(&dev, baseline, baseline_len, &cap, 0);
+    printf("[step] E done: rc=%d, HDMI?\n", (int)rc);
     while (true) {
         usbhid_task();
         sleep_ms(16);

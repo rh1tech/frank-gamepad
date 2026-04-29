@@ -10,6 +10,7 @@ if(USB_HID_ENABLED)
 
     target_sources(usbhid INTERFACE
         ${CMAKE_CURRENT_LIST_DIR}/hid_app.c
+        ${CMAKE_CURRENT_LIST_DIR}/xinput_host.c
     )
 
     target_include_directories(usbhid INTERFACE

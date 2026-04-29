@@ -2,8 +2,9 @@
 
 A USB gamepad button-mapping tool for the RP2350 (M2 board layout).
 
-Plug any USB HID gamepad in and it walks you through pressing each of the 12
-SNES-style buttons. It diffs the raw HID reports against a quiescent baseline
+Plug any USB HID gamepad — or an Xbox 360 / Xbox One / Original Xbox pad
+over XInput — in and it walks you through pressing each of the 12
+SNES-style buttons. It diffs the raw reports against a quiescent baseline
 to figure out which byte (or bit) changes for each button, and writes the
 result to the SD card as `gamepad_VID_PID.txt`.
 
@@ -28,6 +29,9 @@ No extra wiring needed.
 - On-screen SNES-style controller schematic, with the button you should press
   next highlighted
 - 12-step guided capture
+- Supports generic USB HID gamepads AND XInput controllers
+  (Xbox 360 wired/wireless, Xbox One, Original Xbox). XInput reports are
+  normalised to a canonical 8-byte frame so the output format is identical
 - Writes a plain-text `gamepad_VID_PID.txt` to the SD card root
 - Loops after each capture so you can enumerate several pads in one session
 - HDMI runs on Core 1, USB host and capture state machine on Core 0, so HDMI
@@ -119,6 +123,7 @@ Example for a DragonRise USB joystick (VID 0x0079, PID 0x0011):
 
 ```
 # frank-gamepad capture log
+Source=HID
 VID=0x0079
 PID=0x0011
 Manufacturer=(none)
@@ -150,6 +155,25 @@ Each captured line is one of:
 
 The `#   raw:` line always shows the full report observed when the button
 was pressed, so downstream firmware can use whichever form is easier.
+
+For XInput pads, the captured report is a canonical 8-byte frame rather
+than the raw USB packet:
+
+```
+byte[0] = wButtons low  (DPAD U/D/L/R, START, BACK, LS, RS)
+byte[1] = wButtons high (LB, RB, GUIDE, SHARE, A, B, X, Y)
+byte[2] = left trigger  (0..255)
+byte[3] = right trigger (0..255)
+byte[4] = left stick X, high byte
+byte[5] = left stick Y, high byte
+byte[6] = right stick X, high byte
+byte[7] = right stick Y, high byte
+```
+
+This keeps the `byte[N]:+0xMM` output format uniform across both transports,
+so downstream firmware doesn't need to know whether the pad was an HID
+joystick or an Xbox controller. A `Source=HID` or `Source=XINPUT` line at
+the top of the log records which path captured the data.
 
 ## Building
 
@@ -243,6 +267,7 @@ components bundled with this repository.
 | [FatFS](http://elm-chan.org/fsw/ff/) | ChaN | Custom permissive | FAT32 filesystem |
 | [pico_fatfs_test](https://github.com/elehobica/pico_fatfs_test) | Elehobica | BSD-2-Clause | SD card PIO-SPI driver |
 | [TinyUSB](https://github.com/hathach/tinyusb) | Ha Thach | MIT | USB HID host |
+| [tusb_xinput](https://github.com/Ryzee119/tusb_xinput) | Ryan Wendland (usb64) | MIT | TinyUSB XInput class driver (vendored via [SpeccyP](https://github.com/billgilbert7000/SpeccyP)) |
 | [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) | Raspberry Pi Foundation | BSD-3-Clause | Hardware abstraction |
 | [murmsnes](https://github.com/rh1tech/frank-snes) | Mikhail Matveev | GPL-3.0 | HDMI, SD, USB HID drivers |
 
