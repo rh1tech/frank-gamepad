@@ -1,5 +1,7 @@
 # frank-gamepad
 
+Official page: **[frank.rh1.tech](https://frank.rh1.tech/)** — hub for all FRANK boards and firmware.
+
 A USB gamepad button-mapping tool for the RP2350 (M2 board layout).
 
 Plug any USB HID gamepad — or an Xbox 360 / Xbox One / Original Xbox pad
